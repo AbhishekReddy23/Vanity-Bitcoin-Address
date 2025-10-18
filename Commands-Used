@@ -1,0 +1,14 @@
+⚙️ Commands Used
+
+The following commands were executed using **Vanitygen++** to generate Bitcoin vanity addresses based on the increasing character pattern of my first name (`Abhishek`).  
+The `-v` flag is used to display both the **Bitcoin address** and its **public key**.
+
+| Command  | Command Used |
+
+| 1 |  ./vanitygen++ -v 1A 
+| 2 |  ./vanitygen++ -v 1Ab  
+| 3 |  ./vanitygen++ -v 1Abh  
+| 4 |  ./vanitygen++ -v 1Abhi 
+| 5 |  ./vanitygen++ -v 1Abhis 
+| 6 |  ./vanitygen++ -v 1Abhish 
+| 7 |  ./vanitygen++ -v 1Abhishe
