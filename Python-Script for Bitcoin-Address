@@ -1,0 +1,257 @@
+#This Python script along with vanitygen++ is used,Download the required libraries 
+
+#    pip install ecdsa pycryptodome
+#    pip install coincurve
+# I have tried to impleted a estimated time (Its not yet accurate ,but it gives you an overall view of the time taken)
+# The created Bitcoin-Address is stored in a .csv file 
+
+
+import os
+import sys
+import time
+import csv
+import argparse
+import secrets
+import multiprocessing as mp
+import hashlib
+
+# ------------------------ Hashing & Base58 ------------------------
+
+def ripemd160(data: bytes) -> bytes:
+    try:
+        h = hashlib.new("ripemd160")
+        h.update(data)
+        return h.digest()
+    except Exception:
+        try:
+            from Crypto.Hash import RIPEMD160
+        except Exception as e:
+            print("ERROR: RIPEMD160 not available. Install pycryptodome: pip install pycryptodome", file=sys.stderr)
+            raise e
+        h = RIPEMD160.new()
+        h.update(data)
+        return h.digest()
+
+def sha256(b: bytes) -> bytes:
+    return hashlib.sha256(b).digest()
+
+def hash160(b: bytes) -> bytes:
+    return ripemd160(sha256(b))
+
+ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+def b58encode(b: bytes) -> str:
+    n_zeros = len(b) - len(b.lstrip(b"\x00"))
+    num = int.from_bytes(b, "big")
+    out = []
+    while num > 0:
+        num, rem = divmod(num, 58)
+        out.append(ALPHABET[rem])
+    out = "".join(reversed(out)) if out else ""
+    return "1" * n_zeros + out
+
+def b58check_encode(versioned_payload: bytes) -> str:
+    chk = sha256(sha256(versioned_payload))[:4]
+    return b58encode(versioned_payload + chk)
+
+# ------------------------ secp256k1 Key Operations ------------------------
+
+_USE_COINCURVE = False
+try:
+    import coincurve  # type: ignore
+    _USE_COINCURVE = True
+except Exception:
+    from ecdsa import SigningKey, SECP256k1  # type: ignore
+
+def privkey_new() -> bytes:
+    return secrets.token_bytes(32)
+
+def pubkey_from_priv(privkey: bytes, compressed: bool = True) -> bytes:
+    if _USE_COINCURVE:
+        pk = coincurve.PrivateKey(privkey)
+        return pk.public_key.format(compressed=compressed)
+    else:
+        sk = SigningKey.from_string(privkey, curve=SECP256k1)
+        vk = sk.verifying_key
+        x = vk.pubkey.point.x()
+        y = vk.pubkey.point.y()
+        prefix = b"\x02" if (y % 2 == 0) else b"\x03"
+        return prefix + x.to_bytes(32, "big")
+
+def wif_from_priv(privkey: bytes, compressed: bool = True, mainnet: bool = True) -> str:
+    version = b"\x80" if mainnet else b"\xEF"
+    payload = version + privkey + (b"\x01" if compressed else b"")
+    return b58check_encode(payload)
+
+def p2pkh_address_from_pub(pubkey: bytes, mainnet: bool = True) -> str:
+    vh160 = (b"\x00" if mainnet else b"\x6F") + hash160(pubkey)
+    return b58check_encode(vh160)
+
+# ------------------------ Vanity Search Worker ------------------------
+
+def worker_search(prefix: str, found_flag: mp.Value, attempts: mp.Value, result_queue: mp.Queue, mainnet: bool):
+    while True:
+        with found_flag.get_lock():
+            if found_flag.value == 1:
+                return
+        priv = privkey_new()
+        pub = pubkey_from_priv(priv, compressed=True)
+        addr = p2pkh_address_from_pub(pub, mainnet=mainnet)
+        with attempts.get_lock():
+            attempts.value += 1
+        if addr.startswith(prefix):
+            wif = wif_from_priv(priv, compressed=True, mainnet=mainnet)
+            result_queue.put((addr, pub.hex(), wif))
+            with found_flag.get_lock():
+                found_flag.value = 1
+            return
+
+def measure_speed(duration: float = 2.0) -> float:
+    """Roughly measure how many addresses per second can be generated per core."""
+    t0 = time.time()
+    count = 0
+    while time.time() - t0 < duration:
+        priv = privkey_new()
+        pub = pubkey_from_priv(priv, compressed=True)
+        _ = p2pkh_address_from_pub(pub, mainnet=True)
+        count += 1
+    elapsed = time.time() - t0
+    return count / elapsed
+
+def find_one(prefix: str, workers: int, mainnet: bool) -> dict:
+    manager = mp.Manager()
+    result_q: mp.Queue = manager.Queue()
+    found_flag = mp.Value("i", 0)
+    attempts = mp.Value("L", 0)
+
+    procs = []
+    t0 = time.time()
+    try:
+        for _ in range(workers):
+            p = mp.Process(target=worker_search, args=(prefix, found_flag, attempts, result_q, mainnet))
+            p.daemon = True
+            p.start()
+            procs.append(p)
+
+        last_log = t0
+        while True:
+            if not result_q.empty():
+                addr, pub_hex, wif = result_q.get()
+                dt = time.time() - t0
+                for p in procs:
+                    if p.is_alive():
+                        p.terminate()
+                for p in procs:
+                    p.join(timeout=1.0)
+                return {
+                    "prefix": prefix,
+                    "address": addr,
+                    "public_key_compressed_hex": pub_hex,
+                    "wif": wif,
+                    "attempts": int(attempts.value),
+                    "seconds": round(dt, 3),
+                }
+
+            now = time.time()
+            if now - last_log >= 5:
+                at = int(attempts.value)
+                speed = at / (now - t0 + 1e-9)
+                print(f"[{prefix}] attempts={at:,}  ~{speed:,.0f} addr/s", flush=True)
+                last_log = now
+            time.sleep(0.05)
+
+    except KeyboardInterrupt:
+        print("\nInterrupted by user. Terminating workers...", flush=True)
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+        for p in procs:
+            p.join(timeout=1.0)
+        sys.exit(1)
+
+# ------------------------ Main ------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="Vanity Bitcoin P2PKH address generator")
+    parser.add_argument("--workers", type=int, default=max(1, mp.cpu_count() - 1),
+                        help="Number of parallel processes (default: CPU-1)")
+    parser.add_argument("--name", type=str, default=None,
+                        help="Name or text for vanity prefix")
+    parser.add_argument("--outfile", type=str, default=None,
+                        help="Output CSV file (default: vanity_results_<name>.csv)")
+    parser.add_argument("--testnet", action="store_true", help="Use testnet instead of mainnet (recommended for testing)")
+    parser.add_argument("--single", action="store_true", help="Search only full prefix '1<name>'")
+    parser.add_argument("--interactive", action="store_true", help="Run interactively (prompt for input)")
+    args = parser.parse_args()
+
+    # Interactive mode
+    if args.interactive:
+        try:
+            inp_name = input("Enter the name/text for vanity prefix (e.g., 'abhis'): ").strip()
+            if not inp_name:
+                print("❌ Invalid input: no text provided.")
+                sys.exit(2)
+            args.name = inp_name
+            s = input("Search only full prefix '1{}'? (y/N): ".format(args.name)).strip().lower()
+            if s in ("y", "yes"):
+                args.single = True
+        except (KeyboardInterrupt, EOFError):
+            print("\nCanceled by user.")
+            sys.exit(1)
+
+    # Validate name
+    if not args.name or not args.name.strip():
+        print("❌ Error: No name/text provided. Use --name or --interactive mode.", file=sys.stderr)
+        sys.exit(2)
+    name = args.name.strip()
+
+    mainnet = not args.testnet
+    outfile = args.outfile if args.outfile else f"vanity_results_{name}.csv"
+
+    # Define prefixes
+    targets = ["1" + name] if args.single else ["1" + name[:k] for k in range(1, 6)]
+
+    # Measure approximate speed per core
+    print("Measuring performance... please wait ~2s")
+    speed_per_core = measure_speed(duration=2.0)
+    total_speed = speed_per_core * args.workers
+    print(f"≈ {speed_per_core:,.0f} addr/s per core × {args.workers} cores = {total_speed:,.0f} addr/s total\n")
+
+    print(f"Target prefixes: {', '.join(targets)}")
+    print(f"Network: {'mainnet' if mainnet else 'testnet'}\n")
+
+    results = []
+    for i, prefix in enumerate(targets, start=1):
+        prefix_len = len(prefix) - 1  # ignore leading '1'
+        expected = (58 ** prefix_len) / total_speed
+        print(f"=== Searching for address #{i} with prefix '{prefix}' ===")
+        print(f"Estimated average time: ~{expected/60:.2f} minutes (may vary)\n")
+
+        res = find_one(prefix, workers=args.workers, mainnet=mainnet)
+        results.append(res)
+        print(f"[FOUND #{i}] Address: {res['address']}")
+        print(f"             PubKey (compressed, hex): {res['public_key_compressed_hex']}")
+        print(f"             WIF: {res['wif']}")
+        print(f"             Attempts: {res['attempts']:,}   Time: {res['seconds']} s\n")
+
+    # Save results
+    fieldnames = ["order", "prefix", "address", "public_key_compressed_hex", "wif", "attempts", "seconds", "method"]
+    method_str = "Python brute-force secp256k1 (coincurve" + ("" if _USE_COINCURVE else "/ecdsa fallback") + ")"
+    for idx, r in enumerate(results, start=1):
+        r["order"] = idx
+        r["method"] = method_str
+    with open(outfile, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for r in results:
+            writer.writerow(r)
+
+    print(f"✅ Results saved to: {outfile}")
+    print("✨ Done.")
+
+if __name__ == "__main__":
+    try:
+        mp.set_start_method("spawn", force=True)
+    except Exception:
+        pass
+    main()
